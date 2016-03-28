@@ -1,23 +1,26 @@
 FDK-AAC-DABplus Package
 =======================
 
-This package contains an DAB+ encoder that uses the standalone library
-of the Fraunhofer FDK AAC code from Android, patched for
-960-transform to do DAB+ broadcast encoding.
+This package contains a DAB and DAB+ encoder that integrates into the
+ODR-mmbTools.
+
+The DAB encoder is based on toolame. The DAB+ encoder uses a modified library
+of the Fraunhofer FDK AAC code from Android, patched for 960-transform to do
+DAB+ broadcast encoding.
 
 The main tool is the *dabplus-enc* encoder, which can read audio from
 a file (raw or wav), from an ALSA source, from JACK or using libVLC,
 and encode to a file, a pipe, or to a ZeroMQ output compatible with ODR-DabMux.
 
-The ALSA input supports experimental sound card clock drift compensation, that
-can compensate for imprecise sound card clocks.
+The libVLC input allows the encoder to use all inputs supported by VLC, and
+therefore also webstreams and other network sources.
+
+The ALSA and libVLC inputs support experimental sound card clock drift
+compensation, that can compensate for imprecise sound card clocks.
 
 The JACK input does not automatically connect to anything. The encoder runs
 at the rate defined by the system clock, and therefore sound
 card clock drift compensation is also used.
-
-The libVLC input allows the encoder to use all inputs supported by VLC, and
-therefore also webstreams, and other network sources.
 
 *dabplus-enc* includes support for DAB MOT Slideshow and DLS, contributed by
 [CSP](http://rd.csp.it).
@@ -38,12 +41,12 @@ Requirements:
 
 * A C++11 compiler
 * ImageMagick magickwand (optional, for MOT slideshow)
-* The alsa libraries (libasound2)
 * Download and install libfec from https://github.com/Opendigitalradio/ka9q-fec
 * Install ZeroMQ 4.0.4 or more recent
   * If your distribution does not include it, take it from
     from http://download.zeromq.org/zeromq-4.0.4.tar.gz
 * JACK audio connection kit (optional)
+* The alsa libraries (libasound2, optional)
 * libvlc and vlc for the plugins (optional)
 
 This package:
@@ -55,9 +58,9 @@ This package:
     make
     sudo make install
 
-If you want to use the JACK and libVLC input, please use
+If you want to use ALSA, JACK and libVLC inputs, please use
 
-    ./configure --enable-jack --enable-vlc
+    ./configure --enable-alsa --enable-jack --enable-vlc
 
 * See the possible scenarios below on how to use the tools
 * use *mot-encoder* to encode images into MOT Slideshow
@@ -73,8 +76,8 @@ input on port 9000.
     DST="tcp://yourserver:9000"
     BITRATE=64
 
-AAC encoder configuration
--------------------------
+DAB+ AAC encoder configuration
+------------------------------
 By default, when not overridden by the --aaclc, --sbr or --ps options,
 the encoder is configured according to bitrate and number of channels.
 
@@ -84,6 +87,19 @@ HE-AAC) is enabled up to 64kbps. AAC-LC is used for higher bitrates.
 If two channels are used, PS (Parametric Stereo, also called HE-AAC v2)
 is enabled up to 48kbps. Between 56kbps and 80kbps, SBR is enabled. 88kbps
 and higher are using AAC-LC.
+
+ZeroMQ output
+-------------
+
+The ZeroMQ output included in FDK-AAC-DABplus is able to connect to
+one or several instances of ODR-DabMux. The -o option can be used
+more than once to achieve this.
+
+Scenario *wav file for offline processing*
+------------------------------------------
+Wave file encoding, for non-realtime processing
+
+    dabplus-enc -b $BITRATE -i wave_file.wav -o station1.dabp
 
 Scenario *ALSA*
 ---------------
@@ -107,7 +123,12 @@ Read a webstream and send it to ODR-DabMux over ZMQ:
 
     dabplus-enc -v $URL -r 32000 -c 2 -o $DST -l -b $BITRATE
 
-This scenario does not yet support ICY-text extraction for DLS.
+If you need to extract the ICY-Text information, e.g. for DLS, you can use the
+**-w <filename>** option to write the ICY-Text into a file that can be read by
+*mot-encoder*.
+
+If the webstream bitrate is slightly wrong (bad clock at the source), you can
+enable drift compensation with **-D**.
 
 Scenario *JACK input*
 ---------------------
@@ -142,21 +163,10 @@ Then, you can use any media player that has an alsa output to play whatever sour
 Important: you must specify the correct sample rate on both "sides" of the virtual sound card.
 
 
-Scenario *sox and pipes*
-------------------------
-Live Stream encoding and preparing for DAB muxer, with ZMQ output, at 32kHz, using sox.
-This illustrates the fifo input over standard input of *dabplus-enc*.
-
-    sox -t alsa $ALSASRC -b 16 -t raw - rate 32k channels 2 | \
-    dabplus-enc -r 32000 -l \
-    -i - -b $BITRATE -f raw -o $DST -p 53
-
-The -p 53 sets the padlen, compatible with the default *mot-encoder* setting. *mot-encoder* needs
-to be given the same value for this option.
-
-
 Scenario *mplayer and fifo*
 ---------------------------
+*Warning*: Connection through pipes to ODR-DabMux are deprecated in favour of ZeroMQ.
+
 Live Stream resampling (to 32KHz) and encoding from FIFO and preparing for DAB muxer, with FIFO to odr-dabmux
 using mplayer. If there are no data in FIFO, encoder generates silence.
 
@@ -164,14 +174,7 @@ using mplayer. If there are no data in FIFO, encoder generates silence.
     dabplus-enc -l -f raw --fifo-silence -i /tmp/aac.fifo -r 32000 -c 2 -b 72 -o /dev/stdout \
     mbuffer -q -m 10k -P 100 -s 1080 > station1.fifo
 
-*Note*: Do not use /dev/stdout for pcm oputput in mplayer. Mplayer log messages on stdout.
-
-Scenario *wav file for offline processing*
-------------------------------------------
-Wave file encoding, for non-realtime processing
-
-    dabplus-enc -b $BITRATE -i wave_file.wav -o station1.dabp
-
+*Note*: Do not use /dev/stdout for pcm output in mplayer. Mplayer log messages on stdout.
 
 Return values
 -------------
@@ -182,7 +185,7 @@ dabplus-enc returns:
  * 2 if the silence timeout was reached
  * 3 if the AAC encoder failed
  * 4 it the ZeroMQ send failed
- * 5 if the ALSA input had a fault
+ * 5 if the input had a fault
 
 Usage of MOT Slideshow and DLS
 ==============================
@@ -201,9 +204,9 @@ transmitted as PNG without any recompression.
 
 RAW Format
 ----------
-If ImageMagick is not available, or when enable with the -R option, the images
+If ImageMagick is not compiled in, or when enabled with the -R option, the images
 are not modified, and are transmitted as-is. Use this if you can guarantee that
-the generated files are smaller than 50kB and exactly 320x240 pixels.
+the generated files are smaller than 50kB and not larger than 320x240 pixels.
 
 Supported Encoders
 ------------------
@@ -233,6 +236,9 @@ must specify both --charset=0 and --raw-dls.
 
 Known Limitations
 -----------------
+The gain option for libVLC enables the VLC audio compressor with default
+settings. This has more impact than just changing the volume of the audio.
+
 *mot-encoder* encodes slides in a 10 second interval, which is not linked
 to the rate at which the encoder reads the PAD data. It also doesn't prioritise
 DLS transmission over Slides.
@@ -244,4 +250,28 @@ v0.7.0 fixes most issues, and PAD now works much more reliably.
 
 Version 0.4.0 of the encoder changed the ZeroMQ framing. It will only work with
 ODR-DabMux v0.7.0 and later.
+
+LICENCE
+=======
+
+It's complicated. The FDK-AAC-DABplus project contains
+
+ - The Third-Party Modified Version of the Fraunhofer FDK AAC Codec Library for
+   Android, which is under its own licence. See NOTICE. This is built into a
+   shared library.
+ - The code for dabplus-enc in src/ licensed under the Apache Licence v2.0. See
+   http://www.apache.org/licenses/LICENSE-2.0
+ - libtoolame-dab, derived from TooLAME, licensed under LGPL v2.1 or later. See
+   libtoolame-dab/LGPL.txt. This is built into a shared library.
+
+The dabplus-enc binary is linked agains the libtoolame-dab and fdk-aac-dabplus
+shared libraries.
+
+In addition to the audio encoder, there is also mot-encoder, containing code
+
+ - in src/ that is GPL v3+ licensed
+ - and a crc library with unclear licence situation in contrib/
+
+Whether it is legal or not to distribute compiled binaries from these sources
+is unclear to me. Please seek legal advice to answer this question.
 

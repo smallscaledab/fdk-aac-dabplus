@@ -20,6 +20,7 @@
 #include <string>
 #include <cstring>
 #include <chrono>
+#include <functional>
 
 #include "VLCInput.h"
 
@@ -135,9 +136,17 @@ int VLCInput::prepare()
 
 
     // VLC options
+    std::stringstream transcode_options_ss;
+    transcode_options_ss << "acodec=s16l";
+    transcode_options_ss << ",samplerate=" << m_rate;
+    if (not m_gain.empty()) {
+        transcode_options_ss << ",afilter=compressor";
+    }
+    string transcode_options = transcode_options_ss.str();
+
     char smem_options[512];
     snprintf(smem_options, sizeof(smem_options),
-            "#transcode{acodec=s16l,samplerate=%d}:"
+            "#transcode{%s}:"
             // We are using transcode because smem only support raw audio and
             // video formats
             "smem{"
@@ -145,22 +154,56 @@ int VLCInput::prepare()
                 "audio-prerender-callback=%lld,"
                 "audio-data=%lld"
             "}",
-            m_rate,
+            transcode_options.c_str(),
             handleStream_address,
             prepareRender_address,
             (long long int)(intptr_t)this);
 
-    char verb_options[512];
-    snprintf(verb_options, sizeof(verb_options),
-            "--verbose=%d", m_verbosity);
+#define VLC_ARGS_LEN 32
+    const char* vlc_args[VLC_ARGS_LEN];
+    size_t arg_ix = 0;
+    std::stringstream arg_verbose;
+    arg_verbose << "--verbose=" << m_verbosity;
+    vlc_args[arg_ix++] = arg_verbose.str().c_str();
 
-    const char * const vlc_args[] = {
-        verb_options,
-        "--sout", smem_options // Stream to memory
-    };
+    std::string arg_network_caching;
+    if (not m_cache.empty()) {
+        stringstream ss;
+        ss << "--network-caching=" << m_cache;
+        arg_network_caching = ss.str();
+        vlc_args[arg_ix++] = arg_network_caching.c_str();
+    }
+
+    std::string arg_gain;
+    if (not m_gain.empty()) {
+        stringstream ss;
+        ss << "--compressor-makeup=" << m_gain;
+        arg_gain = ss.str();
+        vlc_args[arg_ix++] = arg_gain.c_str();
+    }
+
+    vlc_args[arg_ix++] = "--sout";
+    vlc_args[arg_ix++] = smem_options; // Stream to memory
+
+    for (const auto& opt : m_additional_opts) {
+        if (arg_ix < VLC_ARGS_LEN) {
+            vlc_args[arg_ix++] = opt.c_str();
+        }
+        else {
+            fprintf(stderr, "Too many VLC options given");
+            return 1;
+        }
+    }
+
+    if (m_verbosity) {
+        fprintf(stderr, "Initialising VLC with options:\n");
+        for (size_t i = 0; i < arg_ix; i++) {
+            fprintf(stderr, "  %s\n", vlc_args[i]);
+        }
+    }
 
     // Launch VLC
-    m_vlc = libvlc_new(sizeof(vlc_args) / sizeof(vlc_args[0]), vlc_args);
+    m_vlc = libvlc_new(arg_ix, vlc_args);
 
     libvlc_set_exit_handler(m_vlc, handleVLCExit, this);
 
@@ -218,7 +261,7 @@ void VLCInput::exit_cb()
     fprintf(stderr, "VLC exit, restarting...\n");
 
     cleanup();
-    m_current_buf.empty();
+    m_current_buf.clear();
     prepare();
 }
 
@@ -284,7 +327,7 @@ ssize_t VLCInput::m_read(uint8_t* buf, size_t length)
     return err;
 }
 
-ssize_t VLCInput::read(uint8_t* buf, size_t length)
+ssize_t VLCInputDirect::read(uint8_t* buf, size_t length)
 {
     int bytes_per_frame = m_channels * BYTES_PER_SAMPLE;
     assert(length % bytes_per_frame == 0);
@@ -294,12 +337,78 @@ ssize_t VLCInput::read(uint8_t* buf, size_t length)
     return read;
 }
 
-void VLCInput::write_icy_text(const std::string& filename) const
+bool write_icy_to_file(const std::string& text, const std::string& filename)
 {
     FILE* fd = fopen(filename.c_str(), "wb");
-    fputs_unlocked(m_nowplaying.c_str(), fd);
-    fclose(fd);
+    if (fd) {
+        int ret = fputs(text.c_str(), fd);
+        fclose(fd);
+
+        return ret >= 0;
+    }
+
+    return false;
 }
+
+void VLCInput::write_icy_text(const std::string& filename)
+{
+    if (icy_text_written.valid()) {
+        auto status = icy_text_written.wait_for(std::chrono::microseconds(1));
+        if (status == std::future_status::ready) {
+            if (not icy_text_written.get()) {
+                fprintf(stderr, "Failed to write ICY Text to file!\n");
+            }
+        }
+    }
+
+    else {
+        if (m_nowplaying_previous != m_nowplaying) {
+            icy_text_written = std::async(std::launch::async,
+                    std::bind(write_icy_to_file, m_nowplaying, filename));
+
+        }
+
+        m_nowplaying_previous = m_nowplaying;
+    }
+}
+
+
+// ==================== VLCInputThreaded ====================
+
+void VLCInputThreaded::start()
+{
+    if (m_fault) {
+        fprintf(stderr, "Cannot start VLC input. Fault detected previsouly!\n");
+    }
+    else {
+        m_running = true;
+        m_thread = std::thread(&VLCInputThreaded::process, this);
+    }
+}
+
+// How many samples we insert into the queue each call
+// 10 samples @ 32kHz = 3.125ms
+#define NUM_BYTES_PER_CALL (10 * BYTES_PER_SAMPLE)
+
+void VLCInputThreaded::process()
+{
+    uint8_t samplebuf[NUM_BYTES_PER_CALL];
+    while (m_running) {
+        ssize_t n = m_read(samplebuf, NUM_BYTES_PER_CALL);
+
+        if (n < 0) {
+            m_running = false;
+            m_fault = true;
+            break;
+        }
+
+        m_queue.push(samplebuf, n);
+    }
+}
+
+
+
+
 
 /* VLC up to version 2.1.0 used a different callback function signature.
  * VLC 2.2.0 uses size_t

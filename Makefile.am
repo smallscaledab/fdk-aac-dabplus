@@ -18,28 +18,67 @@ AM_CPPFLAGS = \
     -I$(top_srcdir)/libFDK/include \
     -I$(top_srcdir)/libPCMutils/include
 
-libfdk_aac_la_LINK = $(LINK) $(libfdk_aac_la_LDFLAGS)
+libfdk_dabplus_la_LINK = $(LINK) $(libfdk_dabplus_la_LDFLAGS)
+libtoolame_dab_la_LINK = $(LINK) $(libtoolame_dab_la_LDFLAGS)
 # Mention a dummy pure C file to trigger generation of the $(LINK) variable
-nodist_EXTRA_libfdk_aac_la_SOURCES = dummy.c
+nodist_EXTRA_libfdk_dabplus_la_SOURCES = dummy.c
 
-fdk_aacincludedir = $(includedir)/fdk-aac
-fdk_aacinclude_HEADERS = \
+fdk_dabplusincludedir = $(includedir)/fdk-dabplus
+fdk_dabplusinclude_HEADERS = \
     $(top_srcdir)/libSYS/include/machine_type.h \
     $(top_srcdir)/libSYS/include/genericStds.h \
     $(top_srcdir)/libSYS/include/FDK_audio.h \
     $(top_srcdir)/libAACenc/include/aacenc_lib.h \
     $(top_srcdir)/libAACdec/include/aacdecoder_lib.h
 
+toolame_dabincludedir = $(includedir)/libtoolame-dab
+toolame_dabinclude_HEADERS = \
+	$(top_srcdir)/libtoolame-dab/absthr.h \
+	$(top_srcdir)/libtoolame-dab/ath.h \
+	$(top_srcdir)/libtoolame-dab/availbits.h \
+	$(top_srcdir)/libtoolame-dab/bitstream.h \
+	$(top_srcdir)/libtoolame-dab/common.h \
+	$(top_srcdir)/libtoolame-dab/crc.h \
+	$(top_srcdir)/libtoolame-dab/critband.h \
+	$(top_srcdir)/libtoolame-dab/encode.h \
+	$(top_srcdir)/libtoolame-dab/encode_new.h \
+	$(top_srcdir)/libtoolame-dab/encoder.h \
+	$(top_srcdir)/libtoolame-dab/enwindow.h \
+	$(top_srcdir)/libtoolame-dab/fft.h \
+	$(top_srcdir)/libtoolame-dab/freqtable.h \
+	$(top_srcdir)/libtoolame-dab/ieeefloat.h \
+	$(top_srcdir)/libtoolame-dab/mem.h \
+	$(top_srcdir)/libtoolame-dab/musicin.h \
+	$(top_srcdir)/libtoolame-dab/options.h \
+	$(top_srcdir)/libtoolame-dab/portableio.h \
+	$(top_srcdir)/libtoolame-dab/psycho_0.h \
+	$(top_srcdir)/libtoolame-dab/psycho_1.h \
+	$(top_srcdir)/libtoolame-dab/psycho_1_priv.h \
+	$(top_srcdir)/libtoolame-dab/psycho_2.h \
+	$(top_srcdir)/libtoolame-dab/psycho_3.h \
+	$(top_srcdir)/libtoolame-dab/psycho_3priv.h \
+	$(top_srcdir)/libtoolame-dab/psycho_4.h \
+	$(top_srcdir)/libtoolame-dab/psycho_n1.h \
+	$(top_srcdir)/libtoolame-dab/subband.h \
+	$(top_srcdir)/libtoolame-dab/tables.h \
+	$(top_srcdir)/libtoolame-dab/toolame.h \
+	$(top_srcdir)/libtoolame-dab/utils.h
+
 pkgconfigdir = $(libdir)/pkgconfig
-pkgconfig_DATA = fdk-aac-dabplus.pc
+pkgconfig_DATA = fdk-dabplus.pc
 
-lib_LTLIBRARIES = libfdk-aac.la
+lib_LTLIBRARIES = libfdk-dabplus.la libtoolame-dab.la
 
-libfdk_aac_la_CXXFLAGS = -fno-exceptions -fno-rtti
-libfdk_aac_la_LDFLAGS = -version-info @FDK_AAC_VERSION@ -no-undefined \
-    -export-symbols $(top_srcdir)/fdk-aac.sym
+libtoolame_dab_la_CFLAGS  = -fomit-frame-pointer -DNEWENCODE -std=c99
+libtoolame_dab_la_LDFLAGS = -version-info @LIBTOOLAME_DAB_VERSION@ \
+							-no-undefined \
+							-export-symbols $(top_srcdir)/libtoolame-dab.sym
 
-#aac_enc_LDADD   = libfdk-aac.la
+libfdk_dabplus_la_CXXFLAGS = -fno-exceptions -fno-rtti -Wno-narrowing
+libfdk_dabplus_la_LDFLAGS = -version-info @FDK_AAC_VERSION@ -no-undefined \
+						-export-symbols $(top_srcdir)/fdk-dabplus.sym
+
+#aac_enc_LDADD   = libfdk-dabplus.la
 #aac_enc_SOURCES = src/aac-enc.c \
 #				  src/wavreader.c
 
@@ -49,10 +88,17 @@ else
 dabplus_enc_LDADD_JACK  =
 endif
 
+if HAVE_ALSA
+dabplus_enc_LDADD_ALSA  = -lasound
+else
+dabplus_enc_LDADD_ALSA  =
+endif
 
 dabplus_enc_LDFLAGS     = -no-install
-dabplus_enc_LDADD       = libfdk-aac.la -lfec -lzmq -lasound \
+dabplus_enc_LDADD       = libfdk-dabplus.la libtoolame-dab.la \
+						  -lfec -lzmq \
 						  -lrt $(dabplus_enc_LDADD_JACK) \
+						  $(dabplus_enc_LDADD_ALSA) \
 						  $(LIBVLC_LIBS)
 dabplus_enc_CPPFLAGS    = $(AM_CPPFLAGS) $(GITVERSION_FLAGS) -ggdb -O2
 dabplus_enc_SOURCES     = src/dabplus-enc.cpp \
@@ -75,7 +121,8 @@ dabplus_enc_SOURCES     = src/dabplus-enc.cpp \
 						  src/utf8.h \
 						  src/utf8/checked.h \
 						  src/utf8/unchecked.h \
-						  src/utf8/core.h
+						  src/utf8/core.h \
+						  src/common.h
 
 mot_encoder_CXXFLAGS = $(GITVERSION_FLAGS) @MAGICKWAND_CFLAGS@ -Icontrib
 mot_encoder_LDADD    = @MAGICKWAND_LDADD@
@@ -224,18 +271,43 @@ SYS_SRC = \
     libSYS/src/genericStds.cpp \
     libSYS/src/wav_file.cpp
 
-libfdk_aac_la_SOURCES = \
+libfdk_dabplus_la_SOURCES = \
     $(AACDEC_SRC) $(AACENC_SRC) \
     $(MPEGTPDEC_SRC) $(MPEGTPENC_SRC) \
     $(SBRDEC_SRC) $(SBRENC_SRC) \
     $(PCMUTILS_SRC) $(FDK_SRC) $(SYS_SRC)
+
+libtoolame_dab_la_SOURCES = \
+							libtoolame-dab/common.c \
+							libtoolame-dab/encode.c \
+							libtoolame-dab/ieeefloat.c \
+							libtoolame-dab/toolame.c \
+							libtoolame-dab/portableio.c \
+							libtoolame-dab/psycho_n1.c \
+							libtoolame-dab/psycho_0.c \
+							libtoolame-dab/psycho_1.c \
+							libtoolame-dab/psycho_2.c \
+							libtoolame-dab/psycho_3.c \
+							libtoolame-dab/psycho_4.c \
+							libtoolame-dab/fft.c \
+							libtoolame-dab/subband.c \
+							libtoolame-dab/bitstream.c \
+							libtoolame-dab/mem.c \
+							libtoolame-dab/crc.c \
+							libtoolame-dab/tables.c \
+							libtoolame-dab/availbits.c \
+							libtoolame-dab/ath.c \
+							libtoolame-dab/encode_new.c \
+							libtoolame-dab/utils.c
+
 
 EXTRA_DIST = \
     $(top_srcdir)/bootstrap \
     $(top_srcdir)/NOTICE \
     $(top_srcdir)/README.md \
     $(top_srcdir)/Android.mk \
-    $(top_srcdir)/fdk-aac.sym \
+    $(top_srcdir)/fdk-dabplus.sym \
+    $(top_srcdir)/libtoolame-dab.sym \
     $(top_srcdir)/documentation/*.pdf \
     $(top_srcdir)/libAACdec/src/*.h \
     $(top_srcdir)/libAACdec/src/arm/*.cpp \

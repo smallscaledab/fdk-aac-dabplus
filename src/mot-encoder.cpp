@@ -67,9 +67,9 @@ extern "C" {
 #define XSTR(x) #x
 #define STR(x) XSTR(x)
 
-#define MAXSEGLEN 8189 // Bytes (EN 301 234, ch. 5.1.1)
+#define MAXSEGLEN 8189 // Bytes (EN 301 234 v2.1.1, ch. 5.1.1)
 #define MAXDLS 128 // chars
-#define MAXSLIDESIZE 50000 // Bytes
+#define MAXSLIDESIZE 51200 // Bytes (TS 101 499 v3.1.1, ch. 9.1.2)
 
 // Roll-over value for fidx
 #define MAXSLIDEID 9999
@@ -88,6 +88,11 @@ extern "C" {
 #define CHARSET_ISO_LATIN_ALPHABET_2 3 // ISO Latin Alphabet No 2
 #define CHARSET_UCS2_BE 6 // ISO/IEC 10646 using UCS-2 transformation format, big endian byte order
 #define CHARSET_UTF8 15 // ISO Latin Alphabet No 2
+
+
+typedef std::vector<uint8_t> uint8_vector_t;
+static int verbose = 0;
+
 
 struct MSCDG {
     // MSC Data Group Header (extension field not supported)
@@ -205,44 +210,81 @@ class History {
 };
 
 
-/*
-   typedef struct {
-// MOT HEADER CUSTOMIZED FOR SLIDESHOW APP
-unsigned int bodysize;      // 28 bits
-unsigned short int headsize;    // 13 bits
-unsigned char ctype;        //  6 bits
-unsigned char sctype;       //  9 bits
-unsigned char triggertime[5];   // 0x85 0x00 0x00 0x00 0x00 => NOW
-unsigned char contname[14];     // 0xCC 0x0C 0x00 imgXXXX.jpg
-} MOTSLIDEHDR;
-*/
-int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw_slides);
+int encodeFile(int output_fd, std::string& fname, int fidx, bool raw_slides);
 
-void createMotHeader(
+uint8_vector_t createMotHeader(
         size_t blobsize,
         int fidx,
-        unsigned char* mothdr,
-        int* mothdrlen,
         bool jfif_not_png);
 
 void createMscDG(MSCDG* msc, unsigned short int dgtype, int *cindex, unsigned short int segnum,
         unsigned short int lastseg, unsigned short int tid, unsigned char* data,
         unsigned short int datalen);
 
-void packMscDG(unsigned char* mscblob, MSCDG* msc, unsigned short int *bsize);
-void writeMotPAD(int output_fd,
-        unsigned char* mscdg,
-        unsigned short int mscdgsize,
-        unsigned short int padlen);
+struct DATA_GROUP;
+DATA_GROUP* packMscDG(MSCDG* msc);
 
-void create_dls_pads(const std::string& text, const int padlen, const uint8_t charset);
-void writeDLS(int output_fd, const std::string& dls_file, int padlen, uint8_t charset, bool raw_dls);
+void prepend_dls_dgs(const std::string& text, uint8_t charset);
+void writeDLS(int output_fd, const std::string& dls_file, uint8_t charset, bool raw_dls, bool remove_dls);
 
+// PAD related
+#define CRC_LEN 2
 
-int get_xpadlengthmask(int padlen);
-size_t get_xpadlength(int mask);
-#define SHORT_PAD 6
-#define ALLOWED_PADLEN "6 (short X-PAD; only DLS), 23, 26, 34, 42, 58"
+struct DATA_GROUP {
+    uint8_vector_t data;
+    int apptype_start;
+    int apptype_cont;
+    size_t written;
+
+    DATA_GROUP(size_t len, int apptype_start, int apptype_cont) {
+        this->data.resize(len);
+        this->apptype_start = apptype_start;
+        this->apptype_cont = apptype_cont;
+        written = 0;
+    }
+
+    void AppendCRC() {
+        uint16_t crc = 0xFFFF;
+        for (size_t i = 0; i < data.size(); i++)
+            crc = update_crc_ccitt(crc, data[i]);
+        crc = ~crc;
+#if DEBUG
+        fprintf(stderr, "crc=%04x ~crc=%04x\n", crc, ~crc);
+#endif
+
+        data.push_back((crc & 0xFF00) >> 8);
+        data.push_back((crc & 0x00FF));
+    }
+
+    size_t Available() {
+        return data.size() - written;
+    }
+
+    int Write(uint8_t *write_data, size_t len, int *cont_apptype) {
+        size_t written_now = std::min(len, Available());
+
+        // fill up remaining bytes with zero padding
+        memcpy(write_data, &data[written], written_now);
+        memset(write_data + written_now, 0x00, len - written_now);
+
+        // set app type depending on progress
+        int apptype = written > 0 ? apptype_cont : apptype_start;
+
+        written += written_now;
+
+        // prevent continuation of a different DG having the same type
+        if (cont_apptype)
+            *cont_apptype = Available() > 0 ? apptype_cont : -1;
+
+        return apptype;
+    }
+};
+
+#define SHORT_PAD 6         // F-PAD + 1x CI              + 1x  3 bytes data sub-field
+#define VARSIZE_PAD_MIN 8   // F-PAD + 1x CI + end marker + 1x  4 bytes data sub-field
+#define VARSIZE_PAD_MAX 196 // F-PAD + 4x CI              + 4x 48 bytes data sub-field
+#define ALLOWED_PADLEN "6 (short X-PAD), 8 to 196 (variable size X-PAD)"
+
 
 
 // MOT Slideshow related
@@ -250,22 +292,372 @@ static int cindex_header = 0;
 static int cindex_body = 0;
 
 
+class MOTHeader {
+private:
+    size_t header_size;
+    uint8_vector_t data;
+
+    void IncrementHeaderSize(size_t size);
+    void AddParamHeader(int pli, int param_id) {data.push_back((pli << 6) | (param_id & 0x3F));}
+public:
+    MOTHeader(size_t body_size, int content_type, int content_subtype);
+
+    void AddExtension(int param_id);
+    void AddExtension8Bit(int param_id, uint8_t data_field);
+    void AddExtension32Bit(int param_id, uint32_t data_field);
+    void AddExtensionVarSize(int param_id, const uint8_t* data_field, size_t data_field_len);
+    const uint8_vector_t GetData() {return data;}
+};
+
+MOTHeader::MOTHeader(size_t body_size, int content_type, int content_subtype)
+: header_size(0), data(uint8_vector_t(7, 0x00)) {
+    // init header core
+
+    // body size
+    data[0] = (body_size >> 20) & 0xFF;
+    data[1] = (body_size >> 12) & 0xFF;
+    data[2] = (body_size >>  4) & 0xFF;
+    data[3] = (body_size <<  4) & 0xF0;
+
+    // header size
+    IncrementHeaderSize(data.size());
+
+    // content type
+    data[5] |= (content_type << 1) & 0x7E;
+
+    // content subtype
+    data[5] |= (content_subtype >> 8) & 0x01;
+    data[6] |=  content_subtype       & 0xFF;
+}
+
+void MOTHeader::IncrementHeaderSize(size_t size) {
+    header_size += size;
+
+    data[3] &= 0xF0;
+    data[3] |= (header_size >> 9) & 0x0F;
+
+    data[4]  = (header_size >> 1) & 0xFF;
+
+    data[5] &= 0x7F;
+    data[5] |= (header_size << 7) & 0x80;
+}
+
+void MOTHeader::AddExtension(int param_id) {
+    AddParamHeader(0b00, param_id);
+
+    IncrementHeaderSize(1);
+}
+
+void MOTHeader::AddExtension8Bit(int param_id, uint8_t data_field) {
+    AddParamHeader(0b01, param_id);
+    data.push_back(data_field);
+
+    IncrementHeaderSize(2);
+}
+
+void MOTHeader::AddExtension32Bit(int param_id, uint32_t data_field) {
+    AddParamHeader(0b10, param_id);
+    data.push_back((data_field >> 24) & 0xFF);
+    data.push_back((data_field >> 16) & 0xFF);
+    data.push_back((data_field >>  8) & 0xFF);
+    data.push_back( data_field        & 0xFF);
+
+    IncrementHeaderSize(5);
+}
+
+void MOTHeader::AddExtensionVarSize(int param_id, const uint8_t* data_field, size_t data_field_len) {
+    AddParamHeader(0b11, param_id);
+
+    // longer field lens use 15 instead of 7 bits
+    bool ext = data_field_len > 127;
+    if (ext) {
+        data.push_back(0x80 | ((data_field_len >> 8) & 0x7F));
+        data.push_back(data_field_len & 0xFF);
+    } else {
+        data.push_back(data_field_len & 0x7F);
+    }
+
+    for (size_t i = 0; i < data_field_len; i++)
+        data.push_back(data_field[i]);
+
+    IncrementHeaderSize(1 + (ext ? 2 : 1) + data_field_len);
+}
+
+
+
 // DLS related
 #define FPAD_LEN 2
 #define DLS_SEG_LEN_PREFIX       2
 #define DLS_SEG_LEN_CHAR_MAX    16
-#define DLS_SEG_LEN_CRC          2
-#define DLS_SEG_LEN_MAX         (DLS_SEG_LEN_PREFIX + DLS_SEG_LEN_CHAR_MAX + DLS_SEG_LEN_CRC)
+#define DLS_CMD_REMOVE_LABEL    0x01
 
 CharsetConverter charset_converter;
 
-typedef std::vector<uint8_t> pad_t;
-static std::deque<pad_t> dls_pads;
+typedef uint8_vector_t pad_t;
 static bool dls_toggle = false;
-std::string dlstext_prev = "";
+static std::string dlstext_prev = "";
+static bool dlstext_prev_set = false;
 
 
-static int verbose = 0;
+
+class PADPacketizer {
+private:
+    static const size_t subfield_lens[];
+
+    const size_t xpad_size_max;
+    const bool short_xpad;
+    const size_t max_cis;
+
+    size_t xpad_size;
+    uint8_t subfields[4*48];
+    size_t subfields_size;
+
+    // PAD w/  CI list
+    int ci_type[4];
+    size_t ci_len_index[4];
+    size_t used_cis;
+
+    // PAD w/o CI list
+    int last_ci_type;
+    size_t last_ci_size;
+
+    size_t AddCINeededBytes();
+    void AddCI(int apptype, int len_index);
+
+    int OptimalSubFieldSizeIndex(size_t available_bytes);
+    int WriteDGToSubField(DATA_GROUP* dg, size_t len);
+
+    bool AppendDG(DATA_GROUP* dg);
+    void AppendDGWithCI(DATA_GROUP* dg);
+    void AppendDGWithoutCI(DATA_GROUP* dg);
+
+    void ResetPAD();
+    pad_t* FlushPAD();
+public:
+    std::deque<DATA_GROUP*> queue;
+
+    PADPacketizer(size_t pad_size);
+    ~PADPacketizer();
+
+    pad_t* GetPAD();
+
+    // will be removed, when pull (instead of push) approach is implemented!
+    void WriteAllPADs(int output_fd);
+};
+
+
+const size_t PADPacketizer::subfield_lens[] = {4, 6, 8, 12, 16, 24, 32, 48};
+
+PADPacketizer::PADPacketizer(size_t pad_size) :
+    xpad_size_max(pad_size - FPAD_LEN),
+    short_xpad(pad_size == SHORT_PAD),
+    max_cis(short_xpad ? 1 : 4),
+    last_ci_type(-1)
+{
+    ResetPAD();
+}
+
+PADPacketizer::~PADPacketizer() {
+    while (!queue.empty()) {
+        delete queue.front();
+        queue.pop_front();
+    }
+}
+
+
+pad_t* PADPacketizer::GetPAD() {
+    bool pad_flushable = false;
+
+    // process DG queue
+    while (!pad_flushable && !queue.empty()) {
+        DATA_GROUP* dg = queue.front();
+
+        // repeatedly append DG
+        while (!pad_flushable && dg->Available() > 0)
+            pad_flushable = AppendDG(dg);
+
+        if (dg->Available() == 0) {
+            delete dg;
+            queue.pop_front();
+        }
+    }
+
+    // (possibly empty) PAD
+    return FlushPAD();
+}
+
+void PADPacketizer::WriteAllPADs(int output_fd) {
+    for (;;) {
+        pad_t* pad = GetPAD();
+
+        // if only F-PAD present, abort
+        if (pad->back() == FPAD_LEN) {
+            delete pad;
+            break;
+        }
+
+        ssize_t dummy = write(output_fd, &(*pad)[0], pad->size());
+        delete pad;
+    }
+}
+
+
+size_t PADPacketizer::AddCINeededBytes() {
+    // returns the amount of additional bytes needed for the next CI
+
+    // special cases: end marker added/replaced
+    if (!short_xpad && used_cis == 0)
+        return 2;
+    if (!short_xpad && used_cis == (max_cis - 1))
+        return 0;
+    return 1;
+}
+
+void PADPacketizer::AddCI(int apptype, int len_index) {
+    ci_type[used_cis] = apptype;
+    ci_len_index[used_cis] = len_index;
+
+    xpad_size += AddCINeededBytes();
+    used_cis++;
+}
+
+
+int PADPacketizer::OptimalSubFieldSizeIndex(size_t available_bytes) {
+    /* Return the index of the optimal sub-field size by stepwise search (regards only Variable Size X-PAD):
+     * - find the smallest sub-field able to hold (at least) all available bytes
+     * - find the biggest regarding sub-field we have space for (which definitely exists - otherwise previously the PAD would have been flushed)
+     * - if the wasted space is at least as big as the smallest possible sub-field, use a sub-field one size smaller
+     */
+    int len_index = 0;
+
+    while ((len_index + 1) < 8 && subfield_lens[len_index] < available_bytes)
+        len_index++;
+    while ((len_index - 1) >= 0 && (subfield_lens[len_index] + AddCINeededBytes()) > (xpad_size_max - xpad_size))
+        len_index--;
+    if ((len_index - 1) >= 0 && ((int) subfield_lens[len_index] - (int) available_bytes) >= (int) subfield_lens[0])
+        len_index--;
+
+    return len_index;
+}
+
+int PADPacketizer::WriteDGToSubField(DATA_GROUP* dg, size_t len) {
+    int apptype = dg->Write(&subfields[subfields_size], len, &last_ci_type);
+    subfields_size += len;
+    xpad_size += len;
+    return apptype;
+}
+
+
+bool PADPacketizer::AppendDG(DATA_GROUP* dg) {
+    /* use X-PAD w/o CIs instead of X-PAD w/ CIs, if we can save some bytes or at least do not waste additional bytes
+     *
+     * Omit CI list in case:
+     * 1.   no pending data sub-fields
+     * 2.   last CI type valid
+     * 3.   last CI type matching current (continuity) CI type
+     * 4a.  short X-PAD; OR
+     * 4ba. size of the last X-PAD being at least as big as the available X-PAD payload in case all CIs are used AND
+     * 4bb. the amount of available DG bytes being at least as big as the size of the last X-PAD in case all CIs are used
+     */
+    if (
+            used_cis == 0 &&
+            last_ci_type != -1 &&
+            last_ci_type == dg->apptype_cont &&
+            (short_xpad ||
+                    (last_ci_size >= (xpad_size_max - max_cis) &&
+                            dg->Available() >= (last_ci_size - max_cis)))
+            ) {
+        AppendDGWithoutCI(dg);
+        return true;
+    } else {
+        AppendDGWithCI(dg);
+
+        // if no further sub-fields could be added, PAD must be flushed
+        if (used_cis == max_cis || subfield_lens[0] + AddCINeededBytes() > (xpad_size_max - xpad_size))
+            return true;
+    }
+    return false;
+}
+
+
+void PADPacketizer::AppendDGWithCI(DATA_GROUP* dg) {
+    int len_index = short_xpad ? 0 : OptimalSubFieldSizeIndex(dg->Available());
+    size_t len_size = short_xpad ? 3 : subfield_lens[len_index];
+
+    int apptype = WriteDGToSubField(dg, len_size);
+    AddCI(apptype, len_index);
+
+#if DEBUG
+    fprintf(stderr, "PADPacketizer: added sub-field w/  CI - type: %2d, size: %2zu\n", apptype, len_size);
+#endif
+}
+
+void PADPacketizer::AppendDGWithoutCI(DATA_GROUP* dg) {
+#if DEBUG
+    int old_last_ci_type = last_ci_type;
+#endif
+
+    WriteDGToSubField(dg, last_ci_size);
+
+#if DEBUG
+    fprintf(stderr, "PADPacketizer: added sub-field w/o CI - type: %2d, size: %2zu\n", old_last_ci_type, last_ci_size);
+#endif
+}
+
+void PADPacketizer::ResetPAD() {
+    xpad_size = 0;
+    subfields_size = 0;
+    used_cis = 0;
+}
+
+pad_t* PADPacketizer::FlushPAD() {
+    pad_t* result = new pad_t(xpad_size_max + FPAD_LEN + 1);
+    pad_t &pad = *result;
+
+    size_t pad_offset = xpad_size_max;
+
+    if (subfields_size > 0) {
+        if (used_cis > 0) {
+            // X-PAD: CIs
+            for (int i = 0; i < used_cis; i++)
+                pad[--pad_offset] = (short_xpad ? 0 : ci_len_index[i]) << 5 | ci_type[i];
+
+            // X-PAD: end marker (if needed)
+            if (used_cis < max_cis)
+                pad[--pad_offset] = 0x00;
+        }
+
+        // X-PAD: sub-fields (reversed on-the-fly)
+        for (size_t off = 0; off < subfields_size; off++)
+            pad[--pad_offset] = subfields[off];
+    } else {
+        // no X-PAD
+        last_ci_type = -1;
+    }
+
+    // zero padding
+    memset(&pad[0], 0x00, pad_offset);
+
+    // F-PAD
+    pad[xpad_size_max + 0] = subfields_size > 0 ? (short_xpad ? 0x10 : 0x20) : 0x00;
+    pad[xpad_size_max + 1] = subfields_size > 0 ? (used_cis > 0 ? 0x02 : 0x00) : 0x00;
+
+    // used PAD len
+    pad[xpad_size_max + FPAD_LEN] = xpad_size + FPAD_LEN;
+
+    last_ci_size = xpad_size;
+    ResetPAD();
+    return result;
+}
+
+
+static PADPacketizer *pad_packetizer;
+
+
+
+
+
+
 
 void usage(char* name)
 {
@@ -295,12 +687,10 @@ void usage(char* name)
                     "                          Default: 58\n"
                     " -c, --charset=ID       ID of the character set encoding used for DLS text input.\n"
                     "                          ID =  0: Complete EBU Latin based repertoire\n"
-                    "                          ID =  1: Latin based common core, Cyrillic, Greek\n"
-                    "                          ID =  2: EBU Latin based core, Arabic, Hebrew, Cyrillic and Greek\n"
-                    "                          ID =  3: ISO Latin Alphabet No 2\n"
                     "                          ID =  6: ISO/IEC 10646 using UCS-2 BE\n"
                     "                          ID = 15: ISO/IEC 10646 using UTF-8\n"
                     "                          Default: 15\n"
+                    " -r, --remove-dls       Always insert a DLS Remove Label command when replacing a DLS text.\n"
                     " -C, --raw-dls          Do not convert DLS texts to Complete EBU Latin based repertoire\n"
                     "                          character set encoding.\n"
                     " -R, --raw-slides       Do not process slides. Integrity checks and resizing\n"
@@ -324,6 +714,7 @@ int main(int argc, char *argv[])
     bool raw_slides = false;
     int  charset = CHARSET_UTF8;
     bool raw_dls = false;
+    bool remove_dls = false;
 
     const char* dir = NULL;
     const char* output = "/tmp/pad.fifo";
@@ -332,6 +723,7 @@ int main(int argc, char *argv[])
     const struct option longopts[] = {
         {"charset",    required_argument,  0, 'c'},
         {"raw-dls",    no_argument,        0, 'C'},
+        {"remove-dls", no_argument,        0, 'r'},
         {"dir",        required_argument,  0, 'd'},
         {"erase",      no_argument,        0, 'e'},
         {"output",     required_argument,  0, 'o'},
@@ -347,13 +739,16 @@ int main(int argc, char *argv[])
     int ch=0;
     int index;
     while(ch != -1) {
-        ch = getopt_long(argc, argv, "eChRc:d:o:p:s:t:v", longopts, &index);
+        ch = getopt_long(argc, argv, "eChRrc:d:o:p:s:t:v", longopts, &index);
         switch (ch) {
             case 'c':
                 charset = atoi(optarg);
                 break;
             case 'C':
                 raw_dls = true;
+                break;
+            case 'r':
+                remove_dls = true;
                 break;
             case 'd':
                 dir = optarg;
@@ -386,27 +781,23 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (get_xpadlengthmask(padlen) == -1) {
+    if (padlen != SHORT_PAD && (padlen < VARSIZE_PAD_MIN || padlen > VARSIZE_PAD_MAX)) {
         fprintf(stderr, "mot-encoder Error: pad length %d invalid: Possible values: "
                 ALLOWED_PADLEN "\n",
                 padlen);
         return 2;
     }
-    if (dir && padlen == SHORT_PAD) {
-        fprintf(stderr, "mot-encoder Error: Slideshow can't be used together with short X-PAD!\n");
-        return 1;
-    }
 
     if (dir && not dls_file.empty()) {
-        fprintf(stderr, "mot-encoder encoding Slideshow from %s and DLS from %s to %s\n",
+        fprintf(stderr, "mot-encoder encoding Slideshow from '%s' and DLS from '%s' to '%s'\n",
                 dir, dls_file.c_str(), output);
     }
     else if (dir) {
-        fprintf(stderr, "mot-encoder encoding Slideshow from %s to %s. No DLS.\n",
+        fprintf(stderr, "mot-encoder encoding Slideshow from '%s' to '%s'. No DLS.\n",
                 dir, output);
     }
     else if (not dls_file.empty()) {
-        fprintf(stderr, "mot-encoder encoding DLS from %s to %s. No Slideshow.\n",
+        fprintf(stderr, "mot-encoder encoding DLS from '%s' to '%s'. No Slideshow.\n",
                 dls_file.c_str(), output);
     }
     else {
@@ -475,6 +866,8 @@ int main(int argc, char *argv[])
     MagickWandGenesis();
 #endif
 
+    pad_packetizer = new PADPacketizer(padlen);
+
     std::list<slide_metadata_t> slides_to_transmit;
     History slides_history(MAXHISTORYLEN);
 
@@ -498,7 +891,7 @@ int main(int argc, char *argv[])
                     slides_to_transmit.push_back(md);
 
                     if (verbose) {
-                        fprintf(stderr, "mot-encoder found slide %s, fidx %d\n", imagepath, md.fidx);
+                        fprintf(stderr, "mot-encoder found slide '%s', fidx %d\n", imagepath, md.fidx);
                     }
                 }
             }
@@ -512,7 +905,7 @@ int main(int argc, char *argv[])
 
             if (not dls_file.empty()) {
                 // Maybe we have no slides, always update DLS
-                writeDLS(output_fd, dls_file, padlen, charset, raw_dls);
+                writeDLS(output_fd, dls_file, charset, raw_dls, remove_dls);
                 sleep(sleepdelay);
             }
 
@@ -522,21 +915,21 @@ int main(int argc, char *argv[])
                     it != slides_to_transmit.end();
                     ++it) {
 
-                ret = encodeFile(output_fd, it->filepath, it->fidx, padlen, raw_slides);
+                ret = encodeFile(output_fd, it->filepath, it->fidx, raw_slides);
                 if (ret != 1) {
-                    fprintf(stderr, "mot-encoder Error: cannot encode file %s\n", it->filepath.c_str());
+                    fprintf(stderr, "mot-encoder Error: cannot encode file '%s'\n", it->filepath.c_str());
                 }
 
                 if (erase_after_tx) {
                     if (unlink(it->filepath.c_str()) == -1) {
-                        fprintf(stderr, "mot-encoder Error: erasing file %s failed: ", it->filepath.c_str());
+                        fprintf(stderr, "mot-encoder Error: erasing file '%s' failed: ", it->filepath.c_str());
                         perror("");
                     }
                 }
 
                 // Always retransmit DLS after each slide, we want it to be updated frequently
                 if (not dls_file.empty()) {
-                    writeDLS(output_fd, dls_file, padlen, charset, raw_dls);
+                    writeDLS(output_fd, dls_file, charset, raw_dls, remove_dls);
                 }
 
                 sleep(sleepdelay);
@@ -550,7 +943,7 @@ int main(int argc, char *argv[])
         }
         else if (not dls_file.empty()) { // only DLS
             // Always retransmit DLS, we want it to be updated frequently
-            writeDLS(output_fd, dls_file, padlen, charset, raw_dls);
+            writeDLS(output_fd, dls_file, charset, raw_dls, remove_dls);
 
             sleep(sleepdelay);
         }
@@ -559,17 +952,42 @@ int main(int argc, char *argv[])
             closedir(pDir);
         }
     }
+
+    delete pad_packetizer;
+
     return 1;
 }
 
-// Resize the image or add a black border around it
+
+DATA_GROUP* createDataGroupLengthIndicator(size_t len) {
+    DATA_GROUP* dg = new DATA_GROUP(2, 1, 1);    // continuation never used (except for comparison at short X-PAD)
+    uint8_vector_t &data = dg->data;
+
+    // Data Group length
+    data[0] = (len & 0x3F00) >> 8;
+    data[1] = (len & 0x00FF);
+
+    // CRC
+    dg->AppendCRC();
+
+    return dg;
+}
+
+
+void warnOnSmallerImage(size_t height, size_t width, std::string& fname) {
+    if (height < 240 || width < 320)
+        fprintf(stderr, "mot-encoder Warning: Image '%s' smaller than recommended size (%zu x %zu < 320 x 240 px)\n", fname.c_str(), width, height);
+}
+
+
+// Scales the image down if needed,
 // so that it is 320x240 pixels.
-// Automatically reduce the quality to make sure the
+// Automatically reduces the quality to make sure the
 // blobsize is not too large.
 //
 // Returns: the blobsize
 #if HAVE_MAGICKWAND
-size_t resizeImage(MagickWand* m_wand, unsigned char** blob)
+size_t resizeImage(MagickWand* m_wand, unsigned char** blob, std::string& fname)
 {
     size_t blobsize;
     size_t height = MagickGetImageHeight(m_wand);
@@ -591,13 +1009,6 @@ size_t resizeImage(MagickWand* m_wand, unsigned char** blob)
 
     height = MagickGetImageHeight(m_wand);
     width  = MagickGetImageWidth(m_wand);
-
-    // Make sure smaller images are 320x240 pixels, and
-    // add a black border
-    p_wand = NewPixelWand();
-    PixelSetColor(p_wand, "black");
-    MagickBorderImage(m_wand, p_wand, (320-width)/2, (240-height)/2);
-    DestroyPixelWand(p_wand);
 
     MagickSetImageFormat(m_wand, "jpg");
 
@@ -621,25 +1032,29 @@ size_t resizeImage(MagickWand* m_wand, unsigned char** blob)
         fprintf(stderr, "mot-encoder resized image to %zu x %zu. Size after compression %zu bytes (q=%d)\n",
                 width, height, blobsize, quality);
     }
+
+    // warn if resized image smaller than default dimension
+    warnOnSmallerImage(height, width, fname);
+
     return blobsize;
 }
 #endif
 
-int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw_slides)
+int encodeFile(int output_fd, std::string& fname, int fidx, bool raw_slides)
 {
     int ret = 0;
-    int fd=0, mothdrlen, nseg, lastseglen, i, last, curseglen;
-    unsigned char mothdr[32];
+    int fd=0, nseg, lastseglen, i, last, curseglen;
 #if HAVE_MAGICKWAND
     MagickWand *m_wand = NULL;
     MagickBooleanType err;
 #endif
     size_t blobsize, height, width;
+    bool jpeg_progr;
     unsigned char *blob = NULL;
     unsigned char *curseg = NULL;
     MSCDG msc;
-    unsigned char mscblob[9 + MAXSEGLEN + 2];   // headers + segment + CRC
-    unsigned short int mscblobsize;
+    DATA_GROUP* dgli;
+    DATA_GROUP* mscdg;
 
     size_t orig_quality;
     char*  orig_format = NULL;
@@ -658,6 +1073,9 @@ int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw
      *
      * For JPEG input files that are already at the right resolution and at the
      * right blobsize, we disable this to avoid quality loss due to recompression
+     *
+     * As device support of this feature is optional, we furthermore require JPEG input
+     * files to not have progressive coding.
      */
     bool resize_required = true;
 
@@ -670,7 +1088,7 @@ int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw
 
         err = MagickReadImage(m_wand, fname.c_str());
         if (err == MagickFalse) {
-            fprintf(stderr, "mot-encoder Error: Unable to load image %s\n",
+            fprintf(stderr, "mot-encoder Error: Unable to load image '%s'\n",
                     fname.c_str());
 
             goto encodefile_out;
@@ -679,9 +1097,13 @@ int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw
         height       = MagickGetImageHeight(m_wand);
         width        = MagickGetImageWidth(m_wand);
         orig_format  = MagickGetImageFormat(m_wand);
+        jpeg_progr   = MagickGetImageInterlaceScheme(m_wand) == JPEGInterlace;
 
         // By default assume that the image has full quality and can be reduced
         orig_quality = 100;
+
+        // strip unneeded information (profiles, meta data)
+        MagickStripImage(m_wand);
 
         if (orig_format) {
             if (strcmp(orig_format, "JPEG") == 0) {
@@ -689,9 +1111,9 @@ int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw
                 orig_is_jpeg = true;
 
                 if (verbose) {
-                    fprintf(stderr, "mot-encoder image: %s (id=%d)."
-                            " Original size: %zu x %zu. (%s, q=%zu)\n",
-                            fname.c_str(), fidx, width, height, orig_format, orig_quality);
+                    fprintf(stderr, "mot-encoder image: '%s' (id=%d)."
+                            " Original size: %zu x %zu. (%s, q=%zu, progr=%s)\n",
+                            fname.c_str(), fidx, width, height, orig_format, orig_quality, jpeg_progr ? "y" : "n");
                 }
             }
             else if (strcmp(orig_format, "PNG") == 0) {
@@ -699,13 +1121,13 @@ int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw
                 jfif_not_png = false;
 
                 if (verbose) {
-                    fprintf(stderr, "mot-encoder image: %s (id=%d)."
+                    fprintf(stderr, "mot-encoder image: '%s' (id=%d)."
                             " Original size: %zu x %zu. (%s)\n",
                             fname.c_str(), fidx, width, height, orig_format);
                 }
             }
             else if (verbose) {
-                fprintf(stderr, "mot-encoder image: %s (id=%d)."
+                fprintf(stderr, "mot-encoder image: '%s' (id=%d)."
                         " Original size: %zu x %zu. (%s)\n",
                         fname.c_str(), fidx, width, height, orig_format);
             }
@@ -713,20 +1135,20 @@ int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw
             free(orig_format);
         }
         else {
-            fprintf(stderr, "mot-encoder Warning: Unable to detect image format %s\n",
+            fprintf(stderr, "mot-encoder Warning: Unable to detect image format of '%s'\n",
                     fname.c_str());
 
-            fprintf(stderr, "mot-encoder image: %s (id=%d).  Original size: %zu x %zu.\n",
+            fprintf(stderr, "mot-encoder image: '%s' (id=%d).  Original size: %zu x %zu.\n",
                     fname.c_str(), fidx, width, height);
         }
 
-        if ((orig_is_jpeg || orig_is_png) && height == 240 && width == 320) {
+        if ((orig_is_jpeg || orig_is_png) && height <= 240 && width <= 320 && not jpeg_progr) {
             // Don't recompress the image and check if the blobsize is suitable
             blob = MagickGetImagesBlob(m_wand, &blobsize);
 
-            if (blobsize < MAXSLIDESIZE) {
+            if (blobsize <= MAXSLIDESIZE) {
                 if (verbose) {
-                    fprintf(stderr, "mot-encoder image: %s (id=%d).  No resize needed: %zu Bytes\n",
+                    fprintf(stderr, "mot-encoder image: '%s' (id=%d).  No resize needed: %zu Bytes\n",
                             fname.c_str(), fidx, blobsize);
                 }
                 resize_required = false;
@@ -734,10 +1156,14 @@ int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw
         }
 
         if (resize_required) {
-            blobsize = resizeImage(m_wand, &blob);
+            blobsize = resizeImage(m_wand, &blob, fname);
 
             // resizeImage always creates a jpg output
             jfif_not_png = true;
+        }
+        else {
+            // warn if unresized image smaller than default dimension
+            warnOnSmallerImage(height, width, fname);
         }
 
 #else
@@ -750,7 +1176,7 @@ int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw
         // read file
         FILE* pFile = fopen(fname.c_str(), "rb");
         if (pFile == NULL) {
-            fprintf(stderr, "mot-encoder Error: Unable to load file %s\n",
+            fprintf(stderr, "mot-encoder Error: Unable to load file '%s'\n",
                     fname.c_str());
             goto encodefile_out;
         }
@@ -761,7 +1187,7 @@ int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw
         rewind(pFile);
 
         if (blobsize > MAXSLIDESIZE) {
-            fprintf(stderr, "mot-encoder Warning: blob in raw-slide %s too large\n",
+            fprintf(stderr, "mot-encoder Warning: blob in raw-slide '%s' too large\n",
                     fname.c_str());
         }
 
@@ -803,12 +1229,15 @@ int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw
             nseg++;
         }
 
-        createMotHeader(blobsize, fidx, mothdr, &mothdrlen, jfif_not_png);
+        uint8_vector_t mothdr = createMotHeader(blobsize, fidx, jfif_not_png);
         // Create the MSC Data Group C-Structure
-        createMscDG(&msc, 3, &cindex_header, 0, 1, fidx, mothdr, mothdrlen);
+        createMscDG(&msc, 3, &cindex_header, 0, 1, fidx, &mothdr[0], mothdr.size());
         // Generate the MSC DG frame (Figure 9 en 300 401)
-        packMscDG(mscblob, &msc, &mscblobsize);
-        writeMotPAD(output_fd, mscblob, mscblobsize, padlen);
+        mscdg = packMscDG(&msc);
+        dgli = createDataGroupLengthIndicator(mscdg->data.size());
+
+        pad_packetizer->queue.push_back(dgli);
+        pad_packetizer->queue.push_back(mscdg);
 
         for (i = 0; i < nseg; i++) {
             curseg = blob + i * MAXSEGLEN;
@@ -822,9 +1251,14 @@ int encodeFile(int output_fd, std::string& fname, int fidx, int padlen, bool raw
             }
 
             createMscDG(&msc, 4, &cindex_body, i, last, fidx, curseg, curseglen);
-            packMscDG(mscblob, &msc, &mscblobsize);
-            writeMotPAD(output_fd, mscblob, mscblobsize, padlen);
+            mscdg = packMscDG(&msc);
+            dgli = createDataGroupLengthIndicator(mscdg->data.size());
+
+            pad_packetizer->queue.push_back(dgli);
+            pad_packetizer->queue.push_back(mscdg);
         }
+
+        pad_packetizer->WriteAllPADs(output_fd);
 
         ret = 1;
     }
@@ -843,45 +1277,27 @@ encodefile_out:
 }
 
 
-void createMotHeader(size_t blobsize, int fidx, unsigned char* mothdr, int* mothdrlen, bool jfif_not_png)
+uint8_vector_t createMotHeader(size_t blobsize, int fidx, bool jfif_not_png)
 {
-    struct stat s;
-    uint8_t MotHeaderCore[7] = {0x00,0x00,0x00,0x00,0x0D,0x04,0x00};
-    uint8_t MotHeaderExt[19] = {0x85,0x00,0x00,0x00,0x00,0xcc,0x0c,
-        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
-    char cntemp[12];
-    int i;
+    // prepare ContentName
+    uint8_t cntemp[10];     // = 1 + 8 + 1 = charset + name + terminator
+    cntemp[0] = 0x0 << 4;   // charset: 0 (Complete EBU Latin based) - doesn't really matter here
+    snprintf((char*) (cntemp + 1), sizeof(cntemp) - 1, "%04d.%s", fidx, jfif_not_png ? "jpg" : "png");
+    if (verbose)
+        fprintf(stderr, "mot-encoder writing image as '%s'\n", cntemp + 1);
 
-    // Set correct content subtype
-    //  ETSI TS 101 756 V1.2.1 Clause 6.1 Table 17
-    if (jfif_not_png) {
-        MotHeaderCore[6] = 0x01;
-    }
-    else {
-        MotHeaderCore[6] = 0x03;
-    }
+    // MOT header - content type: image, content subtype: JFIF / PNG
+    MOTHeader header(blobsize, 0x02, jfif_not_png ? 0x001 : 0x003);
 
-    MotHeaderCore[0] = (blobsize<<4 & 0xFF000000) >> 24;
-    MotHeaderCore[1] = (blobsize<<4 & 0x00FF0000) >> 16;
-    MotHeaderCore[2] = (blobsize<<4 & 0x0000FF00) >> 8;
-    MotHeaderCore[3] = (blobsize<<4 & 0x000000FF);
+    // TriggerTime: NOW
+    header.AddExtension32Bit(0x05, 0x00000000);
 
-    sprintf(cntemp,
-            "img%04d.%s",
-            fidx,
-            jfif_not_png ? "jpg" : "png" );
+    // ContentName: XXXX.jpg / XXXX.png
+    header.AddExtensionVarSize(0x0C, cntemp, sizeof(cntemp) - 1);   // omit terminator
 
-    for (i = 0; i < strlen(cntemp); i++) {
-        MotHeaderExt[8+i] = cntemp[i];
-    }
-    *mothdrlen = 26;
-    for (i = 0; i < 7; i++)
-        mothdr[i] = MotHeaderCore[i];
-    for (i = 0; i < 19; i++)
-        mothdr[7+i] = MotHeaderExt[i];
-
-    return;
+    return header.GetData();
 }
+
 
 void createMscDG(MSCDG* msc, unsigned short int dgtype,
         int *cindex, unsigned short int segnum, unsigned short int lastseg,
@@ -909,11 +1325,12 @@ void createMscDG(MSCDG* msc, unsigned short int dgtype,
 }
 
 
-void packMscDG(unsigned char* b, MSCDG* msc, unsigned short int* bsize)
+DATA_GROUP* packMscDG(MSCDG* msc)
 {
-    int i;
-    unsigned short int crc=0xFFFF;
+    DATA_GROUP* dg = new DATA_GROUP(9 + msc->seglen, 12, 13);
+    uint8_vector_t &b = dg->data;
 
+    // headers
     b[0] = (msc->extflag<<7) | (msc->crcflag<<6) | (msc->segflag<<5) |
            (msc->accflag<<4) | msc->dgtype;
 
@@ -927,26 +1344,38 @@ void packMscDG(unsigned char* b, MSCDG* msc, unsigned short int* bsize)
     b[7] = (msc->rcount << 5) | ((msc->seglen & 0x1F00)>>8);
     b[8] =  msc->seglen & 0x00FF;
 
-    for (i = 0; i<9; i++) {
-        crc = update_crc_ccitt(crc, b[i]);
-    }
+    // data field
+    memcpy(&b[9], msc->segdata, msc->seglen);
 
-    for(i = 0; i < msc->seglen; i++) {
-        b[i+9] = (msc->segdata)[i];
-        crc = update_crc_ccitt(crc, b[i+9]);
-    }
+    // CRC
+    dg->AppendCRC();
 
-    crc = ~crc;
-    b[9+msc->seglen]   = (crc & 0xFF00) >> 8;     // HI CRC
-    b[9+msc->seglen+1] =  crc & 0x00FF;          // LO CRC
-
-    *bsize = 9 + msc->seglen + 2;
-
-    //write(1,b,9+msc->seglen+1+1);
+    return dg;
 }
 
 
-void writeDLS(int output_fd, const std::string& dls_file, int padlen, uint8_t charset, bool raw_dls)
+DATA_GROUP* createDynamicLabelCommand(uint8_t command) {
+    DATA_GROUP* dg = new DATA_GROUP(2, 2, 3);
+    uint8_vector_t &seg_data = dg->data;
+
+    // prefix: toggle? + first seg + last seg + command flag + command
+    seg_data[0] =
+            (dls_toggle ? (1 << 7) : 0) +
+            (1 << 6) +
+            (1 << 5) +
+            (1 << 4) +
+            command;
+
+    // prefix: charset (though irrelevant here)
+    seg_data[1] = CHARSET_COMPLETE_EBU_LATIN;
+
+    // CRC
+    dg->AppendCRC();
+
+    return dg;
+}
+
+void writeDLS(int output_fd, const std::string& dls_file, uint8_t charset, bool raw_dls, bool remove_dls)
 {
     std::ifstream dls_fstream(dls_file.c_str());
     if (!dls_fstream.is_open()) {
@@ -995,19 +1424,27 @@ void writeDLS(int output_fd, const std::string& dls_file, int padlen, uint8_t ch
         charset = CHARSET_COMPLETE_EBU_LATIN;
 
 
-    // (Re)Create data groups (and thereby toggle the toggle bit) only on (first call or) new text
-    bool dlstext_is_new = dls_pads.empty() || (dlstext != dlstext_prev);
+    // Toggle the toggle bit only on (first call or) new text
+    bool dlstext_is_new = !dlstext_prev_set || (dlstext != dlstext_prev);
     if (verbose) {
         fprintf(stderr, "mot-encoder writing %s DLS text \"%s\"\n", dlstext_is_new ? "new" : "old", dlstext.c_str());
     }
+
+    DATA_GROUP *remove_label_dg = NULL;
     if (dlstext_is_new) {
-        create_dls_pads(dlstext, padlen, charset);
+        if (remove_dls)
+            remove_label_dg = createDynamicLabelCommand(DLS_CMD_REMOVE_LABEL);
+
+        dls_toggle = !dls_toggle;   // indicate changed text
+
         dlstext_prev = dlstext;
+        dlstext_prev_set = true;
     }
 
-    for (size_t i = 0; i < dls_pads.size(); i++) {
-        size_t dummy = write(output_fd, &dls_pads[i].front(), dls_pads[i].size());
-    }
+    prepend_dls_dgs(dlstext, charset);
+    if (remove_label_dg)
+        pad_packetizer->queue.push_front(remove_label_dg);
+    pad_packetizer->WriteAllPADs(output_fd);
 }
 
 
@@ -1017,19 +1454,16 @@ int dls_count(const std::string& text) {
 }
 
 
-size_t dls_get(const std::string& text, const uint8_t charset, const unsigned int seg_index, uint8_t *seg_data) {
-    int seg_count = dls_count(text);
-    if (seg_index >= seg_count)
-        return 0;
-
+DATA_GROUP* dls_get(const std::string& text, uint8_t charset, unsigned int seg_index) {
     bool first_seg = seg_index == 0;
-    bool last_seg  = seg_index == seg_count - 1;
+    bool last_seg  = seg_index == dls_count(text) - 1;
 
     int seg_text_offset = seg_index * DLS_SEG_LEN_CHAR_MAX;
     const char *seg_text_start = text.c_str() + seg_text_offset;
     size_t seg_text_len = MIN(text.size() - seg_text_offset, DLS_SEG_LEN_CHAR_MAX);
-    size_t seg_len = DLS_SEG_LEN_PREFIX + seg_text_len + DLS_SEG_LEN_CRC;
 
+    DATA_GROUP* dg = new DATA_GROUP(DLS_SEG_LEN_PREFIX + seg_text_len, 2, 3);
+    uint8_vector_t &seg_data = dg->data;
 
     // prefix: toggle? + first seg? + last seg? + (seg len - 1)
     seg_data[0] =
@@ -1042,228 +1476,40 @@ size_t dls_get(const std::string& text, const uint8_t charset, const unsigned in
     seg_data[1] = (first_seg ? charset : seg_index) << 4;
 
     // character field
-    memcpy(seg_data + DLS_SEG_LEN_PREFIX, seg_text_start, seg_text_len);
+    memcpy(&seg_data[DLS_SEG_LEN_PREFIX], seg_text_start, seg_text_len);
 
     // CRC
-    uint16_t crc = 0xFFFF;
-    for (int i = 0; i < seg_len - DLS_SEG_LEN_CRC; i++)
-        crc = update_crc_ccitt(crc, seg_data[i]);
-    crc = ~crc;
-#if DEBUG
-    fprintf(stderr, "crc=%04x ~crc=%04x\n", ~crc, crc);
-#endif
-    seg_data[seg_len - 2] = (crc & 0xFF00) >> 8;    // HI CRC
-    seg_data[seg_len - 1] =  crc & 0x00FF;          // LO CRC
+    dg->AppendCRC();
 
 #if DEBUG
     fprintf(stderr, "DL segment:");
-    for (int i = 0; i < seg_len; i++)
+    for (int i = 0; i < seg_data.size(); i++)
         fprintf(stderr, " %02x", seg_data[i]);
     fprintf(stderr, "\n");
 #endif
-    return seg_len;
+    return dg;
 }
 
 
-void create_dls_pads(const std::string& text, const int padlen, const uint8_t charset) {
-    uint8_t seg_data[DLS_SEG_LEN_MAX];
-    int xpadlengthmask = get_xpadlengthmask(padlen);
-
-    dls_pads.clear();
-    dls_toggle = !dls_toggle;   // indicate changed text
-
+void prepend_dls_dgs(const std::string& text, uint8_t charset) {
     // process all DL segments
     int seg_count = dls_count(text);
+    std::vector<DATA_GROUP*> segs;
     for (int seg_index = 0; seg_index < seg_count; seg_index++) {
 #if DEBUG
         fprintf(stderr, "Segment number %d\n", seg_index + 1);
 #endif
-        int seg_len = dls_get(text, charset, seg_index, seg_data);
-        int dg_len;
-        int used_xpad_len;
-
-        // distribute the segment over one or more PADs
-        for (int seg_off = 0; seg_off < seg_len;) {
-            dls_pads.push_back(pad_t(padlen + 1));
-            pad_t &pad = dls_pads.back();
-            int pad_off = padlen - 1;
-
-            bool var_size_pad = padlen != SHORT_PAD;
-            bool ci_needed = seg_off == 0;  // CI needed only at first data group
-
-            if (ci_needed) {
-                dg_len = get_xpadlength(xpadlengthmask);
-
-                // variable size X-PAD: size of first X-PAD = DLS-DG + End of CI list + CI = size of subsequent non-CI X-PADs
-                used_xpad_len = var_size_pad ? dg_len + 1 + 1 : padlen - 2;
-            } else {
-                dg_len = used_xpad_len;
-            }
-            int dg_used = MIN(dg_len, seg_len - seg_off);
-
-
-            // F-PAD Byte L   (CI if needed)
-            pad[pad_off--] = ci_needed ? 0x02 : 0x00;
-
-            // F-PAD Byte L-1 (variable size / short X-PAD)
-            pad[pad_off--] = var_size_pad ? 0x20 : 0x10;
-
-            // CI (app type 2 = DLS, start of X-PAD data group)
-            if (ci_needed)
-                pad[pad_off--] = ((var_size_pad ? xpadlengthmask : 0) << 5) | 0x02;
-
-            // CI end marker
-            if (ci_needed && var_size_pad)
-                pad[pad_off--] = 0x00;
-
-            // segment (part)
-            for (int i = 0; i < dg_used; i++)
-                pad[pad_off--] = seg_data[seg_off + i];
-
-            // NULL PADDING
-            std::fill_n(pad.begin(), pad_off + 1, 0x00);
-
-            // set used pad len
-            pad[padlen] = FPAD_LEN + used_xpad_len;
-
-#if DEBUG
-            fprintf(stderr, "DLS data group:");
-            for (int i = 0; i < padlen; i++)
-                fprintf(stderr, " %02x", pad[i]);
-            fprintf(stderr, "\n");
-#endif
-            seg_off += dg_used;
-        }
+        segs.push_back(dls_get(text, charset, seg_index));
     }
+
+    // prepend to packetizer
+    pad_packetizer->queue.insert(pad_packetizer->queue.begin(), segs.begin(), segs.end());
+
 #if DEBUG
     fprintf(stderr, "PAD length: %d\n", padlen);
-    fprintf(stderr, "DLS text: %s\n", text);
+    fprintf(stderr, "DLS text: %s\n", text.c_str());
     fprintf(stderr, "Number of DL segments: %d\n", seg_count);
-    fprintf(stderr, "Number of DLS data groups: %zu\n", dls_pads.size());
 #endif
-}
-
-void writeMotPAD(int output_fd,
-        unsigned char* mscdg,
-        unsigned short int mscdgsize,
-        unsigned short int padlen)
-{
-
-    unsigned char pad[padlen + 1];
-    int xpadlengthmask, i, j, k;
-    unsigned short int crc;
-
-    xpadlengthmask = get_xpadlengthmask(padlen);
-
-    // Write MSC Data Groups
-    int curseglen, used_xpad_len;
-    for (i = 0; i < mscdgsize; i += curseglen) {
-        uint8_t* curseg;
-        uint8_t  firstseg;
-
-        curseg = &mscdg[i];
-#if DEBUG
-        fprintf(stderr,"Segment offset %d\n",i);
-#endif
-
-        if (i == 0) {             // First segment
-            firstseg = 1;
-            curseglen = get_xpadlength(xpadlengthmask);
-
-            // size of first X-PAD = MSC-DG + DGLI-DG + End of CI list + 2x CI = size of subsequent non-CI X-PADs
-            used_xpad_len = curseglen + 4 + 1 + 2;
-        }
-        else {
-            firstseg = 0;
-            curseglen = used_xpad_len;
-        }
-
-        curseglen = MIN(curseglen, mscdgsize - i);
-
-        if (firstseg == 1) {
-            // FF-PAD Byte L (CI=1)
-            pad[padlen-1] = 0x02;
-
-            // FF-PAD Byte L-1 (Variable size X_PAD)
-            pad[padlen-2] = 0x20;
-
-            // Write Data Group Length Indicator
-            crc = 0xffff;
-            // CI for data group length indicator: data length=4, Application Type=1
-            pad[padlen-3]=0x01;
-            // CI for data group length indicator: Application Type=12 (Start of MOT)
-            pad[padlen-4]=(xpadlengthmask<<5) | 12;
-            // End of CI list
-            pad[padlen-5]=0x00;
-            // RFA+HI Data group length
-            pad[padlen-6]=(mscdgsize & 0x3F00)>>8;
-            pad[padlen-7]=(mscdgsize & 0x00FF);
-            crc = update_crc_ccitt(crc, pad[padlen-6]);
-            crc = update_crc_ccitt(crc, pad[padlen-7]);
-            crc = ~crc;
-            // HI CRC
-            pad[padlen-8]=(crc & 0xFF00) >> 8;
-            // LO CRC
-            pad[padlen-9]=(crc & 0x00FF);
-            k=10;
-        }
-        else {
-            // FF-PAD Byte L (CI=0)
-            pad[padlen-1] = 0x00;
-
-            // FF-PAD Byte L-1 (Variable size X_PAD)
-            pad[padlen-2] = 0x20;
-            k=3;
-        }
-
-        for (j = 0; j < curseglen; j++) {
-            pad[padlen-k-j] = curseg[j];
-        }
-        for (j = padlen-k-curseglen; j >= 0; j--) {
-            pad[j] = 0x00;
-        }
-
-        // set used pad len
-        pad[padlen] = FPAD_LEN + used_xpad_len;
-
-        size_t dummy = write(output_fd, pad, padlen + 1);
-#if DEBUG
-        fprintf(stderr,"MSC Data Group - Segment %d: ",i);
-        for (j=0;j<padlen;j++)
-            fprintf(stderr,"%02x ",pad[j]);
-        fprintf(stderr,"\n");
-#endif
-    }
-}
-
-int get_xpadlengthmask(int padlen)
-{
-    int xpadlengthmask;
-
-    /* Don't forget to change ALLOWED_PADLEN
-     * if you change this check
-     */
-    if (padlen == 23)
-        xpadlengthmask = 3;
-    else if (padlen == 26)
-        xpadlengthmask = 4;
-    else if (padlen == 34)
-        xpadlengthmask = 5;
-    else if (padlen == 42)
-        xpadlengthmask = 6;
-    else if (padlen == 58)
-        xpadlengthmask = 7;
-    else if (padlen == SHORT_PAD)
-        xpadlengthmask = 8; // internal value; used later at get_xpadlength
-    else
-        xpadlengthmask = -1; // Error
-
-    return xpadlengthmask;
-}
-
-size_t get_xpadlength(int mask) {
-    size_t length[] = {4, 6, 8, 12, 16, 24, 32, 48, 3}; // last value used for short X-PAD
-    return length[mask];
 }
 
 int History::find(const fingerprint_t& fp) const
